@@ -543,14 +543,23 @@ def generate_cond(
     )
 
     # ---------- tensor trim (sample-exact) + short fade ----------
-    audio = rearrange(audio, "b d n -> d (b n)")  # [ch, n] or [d, n]
-    audio = audio.to(torch.float32).clamp(-1, 1)
+    # 1. Rearrange to [channels, samples] and ensure float32
+    audio = rearrange(audio, "b d n -> d (b n)").to(torch.float32)
 
-    # trim to deterministic grid length
+    # 2. PEAK NORMALIZATION — prevents clipping distortion
+    # The diffusion model outputs can far exceed [-1, 1].
+    # Hard-clamping (the repo default) chops those peaks → audible distortion.
+    # Instead, scale the whole waveform so the loudest peak sits at -1 dBFS
+    # (≈0.89), leaving headroom to avoid inter-sample clipping in DAWs.
+    max_amp = torch.abs(audio).max()
+    if max_amp > 1e-8:
+        audio = audio / max_amp * 0.89125  # -1 dBFS headroom
+
+    # 3. Trim to the exact deterministic grid length
     end = min(int(audio.shape[-1]), int(clip_samples))
     audio = audio[:, :max(1, end)].contiguous()
 
-    # tiny fade out to avoid clicks
+    # 4. Apply a tiny 15ms fade-out to avoid clicks at the end
     fade_ms = 15.0
     fade_len = int(round((fade_ms / 1000.0) * sample_rate))
     if fade_len > 1 and audio.shape[-1] > 1:
@@ -558,9 +567,11 @@ def generate_cond(
         ramp = torch.linspace(1.0, 0.0, steps=fade_len, device=audio.device, dtype=audio.dtype)
         audio[:, -fade_len:] *= ramp
 
-    wav_i16 = (audio * 32767.0).to(torch.int16).cpu()
+    # 5. Save as float32 WAV — let torchaudio handle bit-depth encoding
+    audio = audio.clamp(-1, 1).cpu()
 
     # Create spectrogram BEFORE returning (spectrogram function expects int16)
+    wav_i16 = (audio * 32767.0).to(torch.int16)
     audio_spectrogram = audio_spectrogram_image(wav_i16, sample_rate=sample_rate)
 
     # ---------- save WAV ----------
@@ -577,7 +588,7 @@ def generate_cond(
     base_name = amended_prompt.replace(" ", "_").replace(",", "").replace(":", "").replace(";", "")
     file_path = get_unique_filename(base_name, seed, output_directory)
 
-    torchaudio.save(file_path, wav_i16, sample_rate)
+    torchaudio.save(file_path, audio, sample_rate)
 
     # ---------- MIDI conversion ----------
     try:
